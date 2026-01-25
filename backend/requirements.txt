@@ -1,0 +1,15 @@
+mysql-connector-python
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+email-validator
+python-dotenv
+authlib
+httpx
+google-generativeai
+
+
