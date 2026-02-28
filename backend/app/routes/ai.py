@@ -1,10 +1,12 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from typing import Optional
 import time
 import httpx
 import os
 import google.generativeai as genai
+import json
+import asyncio
 
 router = APIRouter()
 
@@ -95,14 +97,15 @@ async def analyze_code(request: AnalyzeRequest):
         
     system_prompt = f"{persona}\n\nTask Instructions:\n{mode_instructions}"
 
-    # Map frontend model IDs to OpenRouter model names
+    # Map frontend model IDs to exact OpenRouter Free endpoints
     model_map = {
-        "opus": "anthropic/claude-3-opus",
-        "sonnet": "anthropic/claude-3.5-sonnet",
-        "gpt4": "openai/gpt-4o",
-        "gemini": "google/gemini-2.5-pro",
-        "llama3-8b": "meta-llama/llama-3-8b-instruct",
-        "magicoder": "meta-llama/llama-3-8b-instruct", # fallback if openrouter is used
+        "gemini-free": "google/gemma-3-27b-it:free",
+        "llama-70b-free": "meta-llama/llama-3.3-70b-instruct:free",
+        "llama-8b-free": "meta-llama/llama-3.2-3b-instruct:free",
+        "deepseek-free": "openrouter/free",
+        "mistral-nemo-free": "mistralai/mistral-small-3.1-24b-instruct:free",
+        "qwen-coder-free": "qwen/qwen3-coder:free",
+        "magicoder": "qwen/qwen3-coder:free", # fallback if openrouter is used
     }
     
     # Use mapped name if available, otherwise use original
@@ -146,6 +149,8 @@ async def analyze_code(request: AnalyzeRequest):
                         json={
                             "model": target_model,
                             "messages": [
+                                {"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}
+                            ] if "gemma" in target_model.lower() else [
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_prompt}
                             ],
@@ -156,10 +161,34 @@ async def analyze_code(request: AnalyzeRequest):
                     
                     if response.status_code != 200:
                         print(f"AI API Error: {response.text}")
-                        # If model not found, try to give a helpful specific error
-                        if response.status_code == 404:
-                            raise Exception(f"Model '{target_model}' not found on server.")
-                        raise Exception(f"API Error: {response.status_code}")
+                        if response.status_code == 429 and target_model != "openrouter/free":
+                            print(f"Model {target_model} is rate limited upstream. Falling back to Groq API.")
+                            target_model = "llama-3.3-70b-versatile"
+                            fallback_api_base = "https://api.groq.com/openai/v1"
+                            fallback_api_key = "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"
+                            
+                            # Retry request with fallback model on Groq
+                            response = await client.post(
+                                f"{fallback_api_base}/chat/completions",
+                                headers={"Authorization": f"Bearer {fallback_api_key}"},
+                                json={
+                                    "model": target_model,
+                                    "messages": [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": user_prompt}
+                                    ],
+                                    "temperature": 0.2 if mode in ["debug", "livefix"] else 0.7,
+                                    "max_tokens": 1500,
+                                }
+                            )
+                            if response.status_code != 200:
+                                print(f"Fallback AI API Error: {response.text}")
+                                raise Exception(f"API Error: {response.status_code}")
+                        else:
+                            # If model not found, try to give a helpful specific error
+                            if response.status_code == 404:
+                                raise Exception(f"Model '{target_model}' not found on server.")
+                            raise Exception(f"API Error: {response.status_code}")
 
                     data = response.json()
                     response_text = data["choices"][0]["message"]["content"]
@@ -204,3 +233,121 @@ async def analyze_code(request: AnalyzeRequest):
         tokens=len(response_text) // 4,
         processingTime=processing_time
     )
+
+@router.websocket("/ws/livefix")
+async def websocket_livefix(websocket: WebSocket):
+    await websocket.accept()
+    
+    # We use Groq specifically for LiveFix as per user request
+    api_base = "https://api.groq.com/openai/v1"
+    api_key = "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"
+    timeout_config = httpx.Timeout(60.0, connect=10.0)
+    
+    try:
+        while True:
+            # Wait for messages from the client
+            data = await websocket.receive_text()
+            try:
+                payload = json.loads(data)
+                code = payload.get("code", "")
+                language = payload.get("language", "javascript")
+                file_name = payload.get("file_name", "Unknown")
+                cursor_pos = payload.get("cursor_pos", None)
+                mode = payload.get("mode", "livefix")
+                model_name = "llama-3.3-70b-versatile" # Default fast groq model
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON format payload"})
+                continue
+                
+            if not code:
+                continue
+                
+            mode_instruction = "Analyze the user's code for bugs, errors, and optimizations."
+            mode_instruction = "Analyze the user's code for bugs, errors, and optimizations."
+            if mode == "debug":
+                mode_instruction = "Focus STRICTLY on finding bugs, syntax errors, and logical issues. Ignore incomplete typing."
+            elif mode == "enhance":
+                mode_instruction = "Focus STRICTLY on code quality, readability, performance, and best practices. Do NOT suggest docstrings or type hints."
+            elif mode == "expand":
+                mode_instruction = "Focus on identifying areas where features are missing or could be expanded."
+            elif mode == "teaching":
+                mode_instruction = "Focus on pointing out issues but DO NOT provide the exact code fix. Instead, provide hints or questions in the 'message' and leave 'suggestion' as an empty string."
+            elif mode == "livefix":
+                mode_instruction = "Act as a silent monitor. ONLY flag critical syntax errors, obvious logical bugs, or severe anti-patterns. IGNORE missing docstrings, type hints, or incomplete typing."
+            
+            persona = (
+                f"You are an expert Real-Time AI Coding Advisor ({mode} mode). "
+                f"{mode_instruction} "
+                f"CRITICAL: ALL 'suggestion' values MUST be written strictly in {language.upper()} syntax. DO NOT provide Javascript fixes for Python files. "
+                "Provide ONLY valid JSON as a response, NO Markdown formatting, NO explanations. "
+                "You MUST NOT wrap the JSON in ```json blocks. "
+                "The JSON must be an array of objects. Each object must have: "
+                "'line' (integer corresponding to the 1-indexed line number in the source), "
+                "'severity' (string: 'error', 'warning', or 'info'), "
+                "'message' (string: concise description of the issue), "
+                "and 'suggestion' (string: the exact replacement code for the line/lines, or empty if teaching mode). "
+                "If there are no critical issues relevant to this mode, you MUST return an empty array []. "
+                "Do NOT include any text outside the JSON array."
+            )
+            
+            user_prompt = f"File Context: {file_name}\nLanguage: {language}\nCode:\n{code}\n"
+            if cursor_pos:
+                 user_prompt += f"Cursor is at line: {cursor_pos.get('lineNumber')}, column: {cursor_pos.get('column')}\n"
+                 
+            system_prompt = persona
+            
+            # Groq model mapping
+            target_model = "llama-3.3-70b-versatile"
+            
+            await websocket.send_json({"type": "status", "message": "Analyzing..."})
+            
+            # Start streaming response
+            try:
+                async with httpx.AsyncClient(timeout=timeout_config) as client:
+                    async with client.stream(
+                        "POST", 
+                        f"{api_base}/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "model": target_model,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}
+                            ],
+                            "temperature": 0.1,
+                            "max_tokens": 1000,
+                            "stream": True # Enable streaming
+                        }
+                    ) as response:
+                        if response.status_code != 200:
+                            error_text = await response.aread()
+                            print(f"WS API Error: {error_text}")
+                            if response.status_code == 429:
+                                await websocket.send_json({"type": "error", "message": "API Rate Limit Exceeded. Please wait a moment."})
+                            else:
+                                await websocket.send_json({"type": "error", "message": f"API Error {response.status_code}"})
+                            continue
+                            
+                        full_response = ""
+                        async for chunk in response.aiter_lines():
+                            if chunk.startswith("data: "):
+                                data_str = chunk[6:]
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    json_data = json.loads(data_str)
+                                    delta = json_data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                    if delta:
+                                        full_response += delta
+                                        await websocket.send_json({"type": "chunk", "text": delta})
+                                except json.JSONDecodeError:
+                                    pass
+                                    
+                        await websocket.send_json({"type": "done", "full_text": full_response})
+                        
+            except Exception as e:
+                print(f"WS Stream Exception: {e}")
+                await websocket.send_json({"type": "error", "message": f"Stream failed: {str(e)}"})
+                
+    except WebSocketDisconnect:
+        print("LiveFix Client disconnected")
