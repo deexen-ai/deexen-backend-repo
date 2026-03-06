@@ -1,4 +1,4 @@
-mysql-connector-python
+psycopg2-binary
 fastapi
 uvicorn
 sqlalchemy
@@ -10,5 +10,6 @@ email-validator
 python-dotenv
 authlib
 httpx
-
-
+itsdangerous
+pymysql
+aiofiles

@@ -53,11 +53,17 @@ def list_projects(
     db: Session = Depends(get_db)
 ):
     """List all projects for current user"""
+    with open('debug_projects.log', 'a') as f:
+        f.write(f"\\nGET /projects called by user {current_user.id} ({current_user.email})\\n")
+    
     projects = db.query(Project).filter(
         Project.user_id == current_user.id,
         Project.is_active == True
     ).all()
     
+    with open('debug_projects.log', 'a') as f:
+        f.write(f"Found {len(projects)} projects\\n")
+
     return [
         ProjectResponse(
             id=p.id,
@@ -278,7 +284,7 @@ def get_file_tree(
 @router.get("/{project_id}/files/{file_id}", response_model=FileResponse)
 def get_file(
     project_id: int,
-    file_id: int,
+    file_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -291,10 +297,16 @@ def get_file(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
-    file = db.query(File).filter(
-        File.id == file_id,
-        File.project_id == project_id
-    ).first()
+    if file_id.isdigit():
+        file = db.query(File).filter(
+            File.id == int(file_id),
+            File.project_id == project_id
+        ).first()
+    else:
+        file = db.query(File).filter(
+            File.name == file_id,
+            File.project_id == project_id
+        ).first()
     
     if not file:
         raise HTTPException(status_code=404, detail="File not found")
@@ -314,7 +326,7 @@ def get_file(
 @router.put("/{project_id}/files/{file_id}", response_model=FileResponse)
 def update_file(
     project_id: int,
-    file_id: int,
+    file_id: str,
     data: FileUpdateRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -328,10 +340,16 @@ def update_file(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
-    file = db.query(File).filter(
-        File.id == file_id,
-        File.project_id == project_id
-    ).first()
+    if file_id.isdigit():
+        file = db.query(File).filter(
+            File.id == int(file_id),
+            File.project_id == project_id
+        ).first()
+    else:
+        file = db.query(File).filter(
+            File.name == file_id,
+            File.project_id == project_id
+        ).first()
     
     if not file:
         raise HTTPException(status_code=404, detail="File not found")

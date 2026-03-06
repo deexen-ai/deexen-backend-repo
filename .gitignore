@@ -14,3 +14,7 @@ htmlcov/
 *.sqlite3
 .idea/
 .vscode/
+
+storage/
+*.log
+__pycache__/

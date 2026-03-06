@@ -9,6 +9,7 @@ env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', '.env'
 load_dotenv(dotenv_path=env_path)
 
 from app.routes import auth, profile, projects, oauth
+from app.routes.plugins_router import router as plugins_router
 from app.database import Base, engine
 from app.models.user import User
 from app.models.project import Project
@@ -43,3 +44,4 @@ app.include_router(profile.router, prefix="/profile", tags=["Profile"])
 app.include_router(projects.router, prefix="/projects", tags=["Projects"])
 app.include_router(oauth.router, prefix="/oauth", tags=["OAuth"])
 app.include_router(ai.router, prefix="/ai", tags=["AI"])
+app.include_router(plugins_router, prefix="/plugins", tags=["Plugins"])

@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, T
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
+from app.models.file import File
 
 class Project(Base):
     __tablename__ = "projects"
@@ -15,5 +16,5 @@ class Project(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Relationship
-    user = relationship("User", backref="projects")
-    files = relationship("File", backref="project", cascade="all, delete-orphan")
+    user = relationship("User", back_populates="projects")
+    files = relationship("File", back_populates="project", cascade="all, delete-orphan")

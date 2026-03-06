@@ -8,6 +8,7 @@ import os
 load_dotenv()
 
 from app.routes import auth, profile, projects, oauth
+from app.routes.plugins_router import router as plugins_router
 from app.database import Base, engine
 from app.models.user import User
 from app.models.project import Project
@@ -39,3 +40,4 @@ app.include_router(auth.router, prefix="/auth", tags=["Auth"])
 app.include_router(profile.router, prefix="/profile", tags=["Profile"])
 app.include_router(projects.router, prefix="/projects", tags=["Projects"])
 app.include_router(oauth.router, prefix="/oauth", tags=["OAuth"])
+app.include_router(plugins_router, prefix="/plugins", tags=["Plugins"])
