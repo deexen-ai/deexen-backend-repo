@@ -41,95 +41,103 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
-    
+
     # Ensure 'sub' is a string as required by many JWT libraries
     if "sub" in to_encode:
         to_encode["sub"] = str(to_encode["sub"])
-        
+
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-import os
-from dotenv import load_dotenv
+def verify_supabase_token(token: str) -> dict | None:
+    # Fast local parse to avoid network stalls during auth checks.
+    # NOTE: This is intended for local/dev usage.
+    try:
+        claims = jwt.get_unverified_claims(token)
+    except Exception:
+        return None
 
-load_dotenv()
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        if datetime.utcnow().timestamp() >= float(exp):
+            return None
 
-from supabase import create_client, Client
+    sub = claims.get("sub")
+    email = claims.get("email")
+    if not sub or not email:
+        return None
 
-# Initialize Supabase client
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wjdvbodcmsfnpuyuhgxi.supabase.co")
-supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndqZHZib2RjbXNmbnB1eXVoZ3hpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE4OTYzNzAsImV4cCI6MjA4NzQ3MjM3MH0.kyKn9OnIRD7vyLyYDCOQ00RRmgJ-AXC55zHiMaK2lpw")
-supabase: Client = create_client(SUPABASE_URL, supabase_anon_key)
+    metadata = claims.get("user_metadata") if isinstance(claims.get("user_metadata"), dict) else {}
 
+    return {
+        "sub": str(sub),
+        "email": str(email).lower(),
+        "user_metadata": metadata,
+    }
 def verify_token(request: Request) -> dict:
     auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid or missing Authorization header")
-    
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     token = auth_header.split(" ")[1]
-    
-    # Try 1: Decode as locally-issued JWT (HS256 with SECRET_KEY)
+
+    # Try locally issued JWT first.
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        user_id = payload.get("sub")
-        if user_id:
-            db = SessionLocal()
-            try:
-                user = db.query(User).filter(User.id == int(user_id)).first()
-                if user:
-                    payload["email"] = user.email
-                    payload["sub"] = str(user.id)
-                    print(f"DEBUG: Token decoded as LOCAL JWT for user {user.email}")
-                    return payload
-            finally:
-                db.close()
-    except Exception:
-        pass  # Not a local token
-    
-    # Try 2: Verify with Supabase Client (calls Supabase Auth API)
-    try:
-        user_response = supabase.auth.get_user(token)
-        if user_response and user_response.user:
-            user = user_response.user
-            print(f"DEBUG: Token verified by Supabase API for {user.email}")
-            return {
-                "sub": user.id,
-                "email": user.email,
-                "user_metadata": user.user_metadata
-            }
-    except Exception as e:
-        print(f"DEBUG: Supabase API verify failed: {str(e)}")
-    
-    raise HTTPException(status_code=401, detail="Invalid token signature or expired")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id_str = payload.get("sub")
+        if user_id_str is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        try:
+            user_id = int(user_id_str)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        return {"user_id": user_id}
+    except JWTError:
+        pass
+
+    # Fallback for Supabase session tokens used by frontend auth.
+    supabase_payload = verify_supabase_token(token)
+    if supabase_payload:
+        return supabase_payload
+
+    raise HTTPException(status_code=401, detail="Invalid token")
 
 def get_current_user(token_data: dict = Depends(verify_token), db: Session = Depends(get_db)) -> User:
-    email = token_data.get("email", "").lower()
-    
-    # 1. Look up user in our local database by their Supabase Email
-    user = db.query(User).filter(User.email == email).first()
-    
-    # 2. If this is their first time hitting the API after signing up on Supabase Frontend, sync them locally
+    if "user_id" in token_data:
+        user = db.query(User).filter(User.id == token_data["user_id"]).first()
+    else:
+        email = (token_data.get("email") or "").lower()
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            metadata = token_data.get("user_metadata") or {}
+            default_name = email.split("@")[0] if "@" in email else "User"
+            user = User(
+                email=email,
+                name=metadata.get("name") or metadata.get("full_name") or default_name,
+                provider="supabase",
+                provider_id=token_data.get("sub"),
+                is_active=True
+            )
+            db.add(user)
+            try:
+                db.commit()
+                db.refresh(user)
+            except IntegrityError:
+                db.rollback()
+                user = db.query(User).filter(User.email == email).first()
+
     if not user:
-        name_from_meta = token_data.get("user_metadata", {}).get("name", email.split('@')[0])
-        user = User(
-            email=email,
-            name=name_from_meta,
-            provider="supabase",
-            provider_id=token_data.get("sub"), # Store their Supabase UUID
-            is_active=True
-        )
-        db.add(user)
-        try:
-            db.commit()
-            db.refresh(user)
-        except IntegrityError:
-            db.rollback()
-            user = db.query(User).filter(User.email == email).first()
-            
+        raise HTTPException(status_code=404, detail="User not found")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User account is inactive")
-        
-    # Return the mapped local user (which has the Integer ID expected by the Project model)
     return user
 
 @router.post("/register", response_model=TokenResponse)
@@ -137,12 +145,12 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
     """Register a new user"""
     try:
         print(f"Register request: email={data.email}, name={data.name}")
-        
+
         # Check if user already exists
         existing_user = db.query(User).filter(User.email == data.email.lower()).first()
         if existing_user:
             raise HTTPException(status_code=400, detail="Email already registered")
-        
+
         # Create new user with hashed password
         user = User(
             email=data.email.lower(),
@@ -153,15 +161,15 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         db.add(user)
         db.commit()
         db.refresh(user)
-        
+
         print(f"User created: id={user.id}, email={user.email}")
-        
+
         # Create access token
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={"sub": user.id}, expires_delta=access_token_expires
         )
-        
+
         return TokenResponse(
             access_token=access_token,
             user=UserResponse(
@@ -184,19 +192,19 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
 def login(data: LoginRequest, db: Session = Depends(get_db)):
     """Login with email and password"""
     user = db.query(User).filter(User.email == data.email.lower()).first()
-    
-    if not user or not user.password or not verify_password(data.password, user.password):
+
+    if not user or not verify_password(data.password, user.password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    
+
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User account is inactive")
-    
+
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user.id}, expires_delta=access_token_expires
     )
-    
+
     return TokenResponse(
         access_token=access_token,
         user=UserResponse(

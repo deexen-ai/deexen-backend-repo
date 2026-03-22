@@ -14,15 +14,15 @@ GET /plugins/download/{publisher}/{extension}/{version} – Download .vsix file
 import asyncio
 import logging
 import os
-import shutil
+import shutil   
 import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import httpx
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import JSONResponse
+import httpx  # type: ignore
+from fastapi import APIRouter, HTTPException, Query  # type: ignore
+from fastapi.responses import JSONResponse  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -54,7 +54,7 @@ def _cache_get(key: str) -> Any | None:
         ts, value = _cache[key]
         if time.monotonic() - ts < _CACHE_TTL:
             return value
-        del _cache[key]
+        _cache.pop(key, None)
     return None
 
 def _cache_set(key: str, value: Any) -> None:
@@ -71,6 +71,22 @@ def _get_download_lock(key: str) -> asyncio.Lock:
     if key not in _download_locks:
         _download_locks[key] = asyncio.Lock()
     return _download_locks[key]
+
+
+def _is_valid_vsix(path: Path) -> bool:
+    """Best-effort validation so we never reuse a partial/corrupt VSIX."""
+    if not path.exists() or not path.is_file():
+        return False
+
+    try:
+        if path.stat().st_size <= 0:
+            return False
+        if not zipfile.is_zipfile(path):
+            return False
+        with zipfile.ZipFile(path, "r") as zf:
+            return len(zf.namelist()) > 0
+    except (OSError, zipfile.BadZipFile):
+        return False
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -182,104 +198,185 @@ async def get_plugin_details(publisher: str, extension: str) -> JSONResponse:
 
 
 @router.get("/download/{publisher}/{extension}/{version}")
-async def download_plugin(publisher: str, extension: str, version: str) -> JSONResponse:
+async def download_plugin(publisher: str, extension: str, version: str):
     """
-    Download a .vsix extension file from OpenVSX and store it locally.
-
-    Storage path: storage/plugins/{publisher}.{extension}-{version}.vsix
-
-    Uses per-file async locks to prevent duplicate concurrent downloads of
-    the same extension version.
+    Download and extract a .vsix extension from OpenVSX with real-time progress.
+    Returns Server-Sent Events (SSE) with download percentage and extraction status.
     """
-    # Sanitise inputs to prevent path traversal attacks
+    import json as _json
+    from starlette.responses import StreamingResponse  # type: ignore
+
     for part in (publisher, extension, version):
         if not all(c.isalnum() or c in "-._" for c in part):
             raise HTTPException(status_code=400, detail="Invalid publisher/extension/version characters.")
 
     filename = f"{publisher}.{extension}-{version}.vsix"
     dest_path = STORAGE_DIR / filename
+    part_path = STORAGE_DIR / f"{filename}.part"
+    extracted_dir = STORAGE_DIR / "extracted" / f"{publisher}.{extension}-{version}"
+    extracted_tmp_dir = extracted_dir.with_name(f"{extracted_dir.name}.tmp")
 
-    # Return early if already downloaded
-    if dest_path.exists():
-        logger.info("Plugin already stored: %s", filename)
-        return JSONResponse(content={
-            "status": "ok",
-            "message": "Already downloaded.",
-            "path": str(dest_path.relative_to(Path(__file__).parents[3])),
-        })
+    async def progress_stream():
+        def event(stage: str, progress: int, message: str, **extra):
+            data = {"stage": stage, "progress": progress, "message": message, **extra}
+            return f"data: {_json.dumps(data)}\n\n"
 
-    lock = _get_download_lock(filename)
-    async with lock:
-        # Double-check after acquiring lock (another coroutine may have just finished)
-        if dest_path.exists():
-            return JSONResponse(content={
-                "status": "ok",
-                "message": "Already downloaded.",
-                "path": str(dest_path.relative_to(Path(__file__).parents[3])),
-            })
+        if dest_path.exists() and extracted_dir.exists() and (extracted_dir / "extension" / "package.json").exists():
+            yield event("complete", 100, "Already installed.")
+            return
 
-        # First, fetch extension metadata to get the real download URL
-        logger.info("Fetching download URL for %s/%s@%s", publisher, extension, version)
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            meta = await _get(client, f"{OPENVSX_BASE}/{publisher}/{extension}/{version}")
+        lock = _get_download_lock(filename)
+        async with lock:
+            if dest_path.exists() and extracted_dir.exists() and (extracted_dir / "extension" / "package.json").exists():
+                yield event("complete", 100, "Already installed.")
+                return
 
-        # OpenVSX returns the .vsix download URL in the response
-        download_url = meta.get("files", {}).get("download")
-        if not download_url:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No download URL found for {publisher}.{extension}-{version}.",
-            )
+            yield event("downloading", 0, "Fetching extension metadata...")
+            try:
+                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+                    meta = await _get(client, f"{OPENVSX_BASE}/{publisher}/{extension}/{version}")
+            except Exception as exc:
+                yield event("error", 0, f"Failed to fetch metadata: {exc}")
+                return
 
-        # Download the .vsix file with streaming to avoid loading it all into memory
-        logger.info("Downloading .vsix from %s", download_url)
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0)) as client:
-                async with client.stream("GET", download_url, headers=_build_headers()) as stream:
-                    if stream.status_code != 200:
-                        raise HTTPException(
-                            status_code=stream.status_code,
-                            detail="Failed to download .vsix from OpenVSX.",
-                        )
-                    with open(dest_path, "wb") as f:
-                        async for chunk in stream.aiter_bytes(chunk_size=8192):
-                            f.write(chunk)
-        except (httpx.TimeoutException, httpx.RequestError) as exc:
-            # Clean up partial file on error
-            if dest_path.exists():
-                dest_path.unlink()
-            logger.error("Download failed for %s: %s", filename, exc)
-            raise HTTPException(status_code=502, detail="Failed to download extension file.")
+            download_url = meta.get("files", {}).get("download")
+            if not download_url:
+                yield event("error", 0, "No download URL found.")
+                return
 
-        # Extract the .vsix file to storage/plugins/extracted/{publisher}.{extension}-{version}
-        extracted_dir = STORAGE_DIR / "extracted" / f"{publisher}.{extension}-{version}"
-        extracted_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            logger.info("Extracting %s to %s", filename, extracted_dir)
-            def _extract():
-                with zipfile.ZipFile(dest_path, "r") as zf:
-                    # Very basic zip-slip mitigation
-                    for member in zf.namelist():
-                        if ".." in member or member.startswith("/"):
-                            continue
-                        zf.extract(member, extracted_dir)
-            await asyncio.to_thread(_extract)
-        except Exception as exc:
-            logger.error("Failed to extract %s: %s", filename, exc)
-            shutil.rmtree(extracted_dir, ignore_errors=True)
-            # Ensure the corrupt/unextractable vsix is deleted so we can retry next time
-            dest_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=500, detail="Failed to extract extension package.")
+            if dest_path.exists() and not _is_valid_vsix(dest_path):
+                logger.warning("Removing invalid cached VSIX before redownload: %s", dest_path)
+                try:
+                    dest_path.unlink()
+                except OSError:
+                    pass
 
-    file_size = dest_path.stat().st_size
-    logger.info("Downloaded and extracted %s (%d bytes)", filename, file_size)
+            need_download = not dest_path.exists()
+            if need_download:
+                yield event("downloading", 2, "Starting download...")
+                try:
+                    if part_path.exists():
+                        part_path.unlink(missing_ok=True)
 
-    return JSONResponse(content={
-        "status": "ok",
-        "message": f"Extension {publisher}.{extension}-{version} downloaded and extracted successfully.",
-        "path": str(dest_path.relative_to(Path(__file__).parents[3])),
-        "size_bytes": file_size,
-    })
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0), follow_redirects=True) as client:
+                        async with client.stream("GET", download_url, headers=_build_headers()) as stream:
+                            if stream.status_code != 200:
+                                yield event("error", 0, f"Download failed (HTTP {stream.status_code})")
+                                return
+
+                            total = int(stream.headers.get("content-length", 0))
+                            downloaded: int = 0
+                            last_pct: int = 0
+                            checked_first_chunk = False
+
+                            with open(part_path, "wb") as f:
+                                async for chunk in stream.aiter_bytes(chunk_size=32768):
+                                    chunk_bytes = cast(bytes, chunk)
+
+                                    if not checked_first_chunk and len(chunk_bytes) > 0:
+                                        checked_first_chunk = True
+                                        if not chunk_bytes.startswith(b"PK"):
+                                            preview = chunk_bytes[:120].decode("utf-8", errors="replace")  # type: ignore
+                                            raise ValueError(
+                                                "Download endpoint returned a non-VSIX payload "
+                                                f"(starts with: {preview!r})"
+                                            )
+
+                                    f.write(chunk_bytes)  # type: ignore
+                                    downloaded += len(chunk_bytes)
+
+                                    if total > 0:
+                                        pct = min(int(downloaded * 100 / total), 99)
+                                    else:
+                                        pct = min(int(downloaded / 1024), 99)
+
+                                    if pct > last_pct + 2:  # type: ignore
+                                        last_pct = pct
+                                        size_str = f"{downloaded / 1048576:.1f}MB"
+                                        total_str = f" / {total / 1048576:.1f}MB" if total > 0 else ""
+                                        yield event("downloading", pct, f"Downloading... {size_str}{total_str}")
+
+                            if total > 0 and downloaded != total:
+                                raise ValueError(
+                                    f"Incomplete download: expected {total} bytes, got {downloaded} bytes"
+                                )
+
+                    if dest_path.exists():
+                        try:
+                            dest_path.unlink()
+                        except OSError:
+                            pass
+                    part_path.replace(dest_path)
+
+                    if not _is_valid_vsix(dest_path):
+                        raise ValueError("Downloaded file is not a valid VSIX archive")
+
+                except asyncio.CancelledError:
+                    try:
+                        part_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+                except (httpx.TimeoutException, httpx.RequestError, OSError, ValueError) as exc:
+                    if part_path.exists():
+                        try:
+                            part_path.unlink()
+                        except OSError:
+                            pass
+                    if dest_path.exists() and not _is_valid_vsix(dest_path):
+                        try:
+                            dest_path.unlink()
+                        except OSError:
+                            pass
+                    yield event("error", 0, f"Download failed: {exc}")
+                    return
+
+                yield event("downloading", 100, "Download complete")
+
+            yield event("extracting", 0, "Extracting extension package...")
+            try:
+                if extracted_tmp_dir.exists():
+                    shutil.rmtree(extracted_tmp_dir, ignore_errors=True)
+                if extracted_dir.exists():
+                    shutil.rmtree(extracted_dir, ignore_errors=True)
+                extracted_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+                def _extract() -> None:
+                    with zipfile.ZipFile(dest_path, "r") as zf:
+                        members = [m for m in zf.namelist() if ".." not in m and not m.startswith("/")]
+                        for member in members:
+                            zf.extract(member, extracted_tmp_dir)
+
+                await asyncio.to_thread(_extract)  # type: ignore
+                extracted_tmp_dir.replace(extracted_dir)
+            except asyncio.CancelledError:
+                shutil.rmtree(extracted_tmp_dir, ignore_errors=True)
+                raise
+            except Exception as exc:
+                logger.error("Failed to extract %s: %s", filename, exc)
+                shutil.rmtree(extracted_tmp_dir, ignore_errors=True)
+                shutil.rmtree(extracted_dir, ignore_errors=True)
+                try:
+                    dest_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                yield event("error", 0, f"Extraction failed: {exc}")
+                return
+
+            yield event("extracting", 100, "Extraction complete")
+
+            file_size = dest_path.stat().st_size
+            logger.info("Downloaded and extracted %s (%d bytes)", filename, file_size)
+            yield event("complete", 100, f"Installed {publisher}.{extension} successfully", size_bytes=file_size)
+
+    return StreamingResponse(
+        progress_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.delete("/uninstall/{publisher}/{extension}")
@@ -289,8 +386,8 @@ async def uninstall_plugin(publisher: str, extension: str) -> JSONResponse:
     """
     logger.info("Uninstalling extension: %s/%s", publisher, extension)
     
-    deleted_files = 0
-    deleted_dirs = 0
+    deleted_files: int = 0
+    deleted_dirs: int = 0
 
     # Prefix to look for in both /plugins and /plugins/extracted
     prefix = f"{publisher}.{extension}-"
@@ -299,7 +396,7 @@ async def uninstall_plugin(publisher: str, extension: str) -> JSONResponse:
     for vsix_file in STORAGE_DIR.glob(f"{prefix}*.vsix"):
         try:
             vsix_file.unlink()
-            deleted_files += 1
+            deleted_files += 1  # type: ignore
             logger.debug("Deleted VSIX: %s", vsix_file.name)
         except OSError as e:
             logger.warning("Failed to delete %s: %s", vsix_file, e)
@@ -311,12 +408,18 @@ async def uninstall_plugin(publisher: str, extension: str) -> JSONResponse:
             if ext_dir.is_dir() and ext_dir.name.startswith(prefix):
                 try:
                     shutil.rmtree(ext_dir)
-                    deleted_dirs += 1
+                    deleted_dirs += 1  # type: ignore
                     logger.debug("Deleted extracted directory: %s", ext_dir.name)
                 except OSError as e:
                     logger.warning("Failed to delete dir %s: %s", ext_dir, e)
 
     if deleted_files == 0 and deleted_dirs == 0:
+        # Check if there's a locked VSIX file we couldn't delete
+        locked_vsix = list(STORAGE_DIR.glob(f"{prefix}*.vsix"))
+        if locked_vsix:
+            return JSONResponse(status_code=409, content={
+                "message": f"VSIX file is locked by another process. Restart the server and try again.",
+            })
         return JSONResponse(status_code=404, content={"message": "Plugin not found on disk."})
 
     return JSONResponse(content={

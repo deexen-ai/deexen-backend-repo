@@ -99,6 +99,10 @@ async def analyze_code(request: AnalyzeRequest):
 
     # Map frontend model IDs to exact OpenRouter Free endpoints
     model_map = {
+        "gemini": "google/gemini-2.5-flash",
+        "opus": "anthropic/claude-3.7-sonnet", # mapping to default highest sonnet or opus
+        "sonnet": "anthropic/claude-3.5-sonnet",
+        "gpt4": "openai/gpt-4o",
         "gemini-free": "google/gemma-3-27b-it:free",
         "llama-70b-free": "meta-llama/llama-3.3-70b-instruct:free",
         "llama-8b-free": "meta-llama/llama-3.2-3b-instruct:free",
@@ -155,7 +159,7 @@ async def analyze_code(request: AnalyzeRequest):
                                 {"role": "user", "content": user_prompt}
                             ],
                             "temperature": 0.2 if mode in ["debug", "livefix"] else 0.7,
-                            "max_tokens": 1500,
+                            "max_tokens": 1319,
                         }
                     )
                     
@@ -178,7 +182,7 @@ async def analyze_code(request: AnalyzeRequest):
                                         {"role": "user", "content": user_prompt}
                                     ],
                                     "temperature": 0.2 if mode in ["debug", "livefix"] else 0.7,
-                                    "max_tokens": 1500,
+                                    "max_tokens": 1319,
                                 }
                             )
                             if response.status_code != 200:
@@ -315,7 +319,7 @@ async def websocket_livefix(websocket: WebSocket):
                                 {"role": "user", "content": user_prompt}
                             ],
                             "temperature": 0.1,
-                            "max_tokens": 1000,
+                            "max_tokens": 1319,
                             "stream": True # Enable streaming
                         }
                     ) as response:

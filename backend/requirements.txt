@@ -12,3 +12,5 @@ authlib
 httpx
 google-generativeai
 itsdangerous
+markdown
+supabase
